@@ -9,8 +9,14 @@ fn setup_token<'a>(
     admin: &Address,
     recipient: &Address,
     amount: i128,
-) -> (Address, soroban_sdk::token::StellarAssetClient<'a>, soroban_sdk::token::Client<'a>) {
-    let token_id = env.register_stellar_asset_contract_v2(admin.clone()).address();
+) -> (
+    Address,
+    soroban_sdk::token::StellarAssetClient<'a>,
+    soroban_sdk::token::Client<'a>,
+) {
+    let token_id = env
+        .register_stellar_asset_contract_v2(admin.clone())
+        .address();
     let token_admin_client = soroban_sdk::token::StellarAssetClient::new(env, &token_id);
     let token_client = soroban_sdk::token::Client::new(env, &token_id);
     token_admin_client.mint(recipient, &amount);
