@@ -9,7 +9,6 @@ pub enum DelegationType {
     Management,
 }
 
-
 #[contracttype]
 #[derive(Clone, Debug)]
 pub enum AttestationStatus {
@@ -131,8 +130,6 @@ impl CredenceDelegation {
         e.events()
             .publish((Symbol::new(&e, "attestation_revoked"),), d);
     }
-
-  
 
     /// Retrieve a stored delegation.
     pub fn get_delegation(
