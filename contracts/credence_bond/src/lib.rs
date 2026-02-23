@@ -4,6 +4,10 @@ use soroban_sdk::{
     contract, contractimpl, contracttype, Address, Env, IntoVal, String, Symbol, Val, Vec,
 };
 
+mod early_exit_penalty;
+mod rolling_bond;
+mod tiered_bond;
+
 #[contracttype]
 #[derive(Clone, Debug)]
 pub struct IdentityBond {
@@ -13,6 +17,9 @@ pub struct IdentityBond {
     pub bond_duration: u64,
     pub slashed_amount: i128,
     pub active: bool,
+    pub is_rolling: bool,
+    pub withdrawal_requested_at: u64,
+    pub notice_period: u64,
 }
 
 #[contracttype]
@@ -36,15 +43,37 @@ pub enum DataKey {
     SubjectAttestations(Address),
 }
 
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum BondTier {
+    Bronze,
+    Silver,
+    Gold,
+    Platinum,
+}
+
 #[contract]
 pub struct CredenceBond;
 
 #[contractimpl]
 impl CredenceBond {
-    /// Initialize the contract (admin).
+    /// Initialize the contract (set admin).
     pub fn initialize(e: Env, admin: Address) {
-        admin.require_auth();
         e.storage().instance().set(&DataKey::Admin, &admin);
+    }
+
+    /// Set early exit penalty config (admin only). Penalty in basis points (e.g. 500 = 5%).
+    pub fn set_early_exit_config(e: Env, admin: Address, treasury: Address, penalty_bps: u32) {
+        let stored_admin: Address = e
+            .storage()
+            .instance()
+            .get(&DataKey::Admin)
+            .unwrap_or_else(|| panic!("not initialized"));
+        admin.require_auth();
+        if admin != stored_admin {
+            panic!("not admin");
+        }
+        early_exit_penalty::set_config(&e, treasury, penalty_bps);
     }
 
     /// Register an authorized attester (only admin can call).
@@ -87,12 +116,21 @@ impl CredenceBond {
             .unwrap_or(false)
     }
 
-    /// Create or top-up a bond for an identity. In a full implementation this would
-    /// transfer USDC from the caller and store the bond.
+    /// Create or top-up a bond for an identity (non-rolling helper).
     pub fn create_bond(e: Env, identity: Address, amount: i128, duration: u64) -> IdentityBond {
-        let bond_start = e.ledger().timestamp();
+        Self::create_bond_with_rolling(e, identity, amount, duration, false, 0)
+    }
 
-        // Verify the end timestamp wouldn't overflow
+    /// Create a bond with rolling parameters.
+    pub fn create_bond_with_rolling(
+        e: Env,
+        identity: Address,
+        amount: i128,
+        duration: u64,
+        is_rolling: bool,
+        notice_period: u64,
+    ) -> IdentityBond {
+        let bond_start = e.ledger().timestamp();
         let _end_timestamp = bond_start
             .checked_add(duration)
             .expect("bond end timestamp would overflow");
@@ -104,6 +142,9 @@ impl CredenceBond {
             bond_duration: duration,
             slashed_amount: 0,
             active: true,
+            is_rolling,
+            withdrawal_requested_at: 0,
+            notice_period,
         };
         let key = DataKey::Bond;
         e.storage().instance().set(&key, &bond);
@@ -263,8 +304,114 @@ impl CredenceBond {
             panic!("slashed amount exceeds bonded amount");
         }
 
+        let old_tier = tiered_bond::get_tier_for_amount(bond.bonded_amount + amount);
+        let new_tier = tiered_bond::get_tier_for_amount(bond.bonded_amount);
+        tiered_bond::emit_tier_change_if_needed(&e, &bond.identity, old_tier, new_tier);
+
         e.storage().instance().set(&key, &bond);
         bond
+    }
+
+    /// Withdraw before lock-up end; applies early exit penalty and transfers penalty to treasury.
+    /// Net amount to user = amount - penalty. Use when lock-up has not yet ended.
+    pub fn withdraw_early(e: Env, amount: i128) -> IdentityBond {
+        let key = DataKey::Bond;
+        let mut bond = e
+            .storage()
+            .instance()
+            .get::<_, IdentityBond>(&key)
+            .unwrap_or_else(|| panic!("no bond"));
+
+        let available = bond
+            .bonded_amount
+            .checked_sub(bond.slashed_amount)
+            .expect("slashed amount exceeds bonded amount");
+        if amount > available {
+            panic!("insufficient balance for withdrawal");
+        }
+
+        let now = e.ledger().timestamp();
+        let end = bond.bond_start.saturating_add(bond.bond_duration);
+        if now >= end {
+            panic!("use withdraw for post lock-up");
+        }
+
+        let (treasury, penalty_bps) = early_exit_penalty::get_config(&e);
+        let remaining = end.saturating_sub(now);
+        let penalty = early_exit_penalty::calculate_penalty(
+            amount,
+            remaining,
+            bond.bond_duration,
+            penalty_bps,
+        );
+        early_exit_penalty::emit_penalty_event(&e, &bond.identity, amount, penalty, &treasury);
+
+        let old_tier = tiered_bond::get_tier_for_amount(bond.bonded_amount);
+        bond.bonded_amount = bond
+            .bonded_amount
+            .checked_sub(amount)
+            .expect("withdrawal caused underflow");
+        if bond.slashed_amount > bond.bonded_amount {
+            panic!("slashed amount exceeds bonded amount");
+        }
+        let new_tier = tiered_bond::get_tier_for_amount(bond.bonded_amount);
+        tiered_bond::emit_tier_change_if_needed(&e, &bond.identity, old_tier, new_tier);
+
+        e.storage().instance().set(&key, &bond);
+        bond
+    }
+
+    /// Request withdrawal (rolling bonds). Withdrawal allowed after notice period.
+    pub fn request_withdrawal(e: Env) -> IdentityBond {
+        let key = DataKey::Bond;
+        let mut bond = e
+            .storage()
+            .instance()
+            .get::<_, IdentityBond>(&key)
+            .unwrap_or_else(|| panic!("no bond"));
+        if !bond.is_rolling {
+            panic!("not a rolling bond");
+        }
+        if bond.withdrawal_requested_at != 0 {
+            panic!("withdrawal already requested");
+        }
+        bond.withdrawal_requested_at = e.ledger().timestamp();
+        e.storage().instance().set(&key, &bond);
+        e.events().publish(
+            (Symbol::new(&e, "withdrawal_requested"),),
+            (bond.identity.clone(), bond.withdrawal_requested_at),
+        );
+        bond
+    }
+
+    /// If bond is rolling and period has ended, renew (new period start = now). Emits renewal event.
+    pub fn renew_if_rolling(e: Env) -> IdentityBond {
+        let key = DataKey::Bond;
+        let mut bond = e
+            .storage()
+            .instance()
+            .get::<_, IdentityBond>(&key)
+            .unwrap_or_else(|| panic!("no bond"));
+        if !bond.is_rolling {
+            return bond;
+        }
+        let now = e.ledger().timestamp();
+        if !rolling_bond::is_period_ended(now, bond.bond_start, bond.bond_duration) {
+            return bond;
+        }
+        rolling_bond::apply_renewal(&mut bond, now);
+        e.storage().instance().set(&key, &bond);
+        e.events().publish(
+            (Symbol::new(&e, "bond_renewed"),),
+            (bond.identity.clone(), bond.bond_start, bond.bond_duration),
+        );
+        bond
+    }
+
+    /// Get current tier for the bond's bonded amount.
+    pub fn get_tier(e: Env) -> BondTier {
+        let bond = Self::get_identity_state(e);
+        tiered_bond::get_tier_for_amount(bond.bonded_amount)
     }
 
     /// Slash a portion of the bond. Increases slashed_amount up to the bonded_amount.
@@ -304,10 +451,14 @@ impl CredenceBond {
             .unwrap_or_else(|| panic!("no bond"));
 
         // Perform top-up with overflow protection
+        let old_tier = tiered_bond::get_tier_for_amount(bond.bonded_amount);
         bond.bonded_amount = bond
             .bonded_amount
             .checked_add(amount)
             .expect("top-up caused overflow");
+
+        let new_tier = tiered_bond::get_tier_for_amount(bond.bonded_amount);
+        tiered_bond::emit_tier_change_if_needed(&e, &bond.identity, old_tier, new_tier);
 
         e.storage().instance().set(&key, &bond);
         bond
