@@ -7,6 +7,7 @@ use soroban_sdk::Env;
 #[test]
 fn test_create_bond() {
     let e = Env::default();
+    e.mock_all_auths();
     let contract_id = e.register_contract(None, CredenceBond);
     let client = CredenceBondClient::new(&e, &contract_id);
 
