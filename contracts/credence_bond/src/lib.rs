@@ -59,7 +59,6 @@ pub enum DataKey {
     SubjectAttestations(Address),
 }
 
-#[contracttype]
 #[contract]
 pub struct CredenceBond;
 
@@ -621,9 +620,9 @@ impl CredenceBond {
         e.storage().instance().set(&key, &(current + amount));
     }
 
-    /// Withdraw the full bonded amount back to the identity.
+    /// Withdraw the full bonded amount back to the identity (callback-based, for reentrancy tests).
     /// Uses a reentrancy guard to prevent re-entrance during external calls.
-    pub fn withdraw_bond(e: Env, identity: Address) -> i128 {
+    pub fn withdraw_bond_full(e: Env, identity: Address) -> i128 {
         identity.require_auth();
         Self::acquire_lock(&e);
 
@@ -653,6 +652,9 @@ impl CredenceBond {
             bond_duration: bond.bond_duration,
             slashed_amount: bond.slashed_amount,
             active: false,
+            is_rolling: bond.is_rolling,
+            withdrawal_requested_at: bond.withdrawal_requested_at,
+            notice_period_duration: bond.notice_period_duration,
         };
         e.storage().instance().set(&bond_key, &updated);
 
@@ -711,6 +713,9 @@ impl CredenceBond {
             bond_duration: bond.bond_duration,
             slashed_amount: new_slashed,
             active: bond.active,
+            is_rolling: bond.is_rolling,
+            withdrawal_requested_at: bond.withdrawal_requested_at,
+            notice_period_duration: bond.notice_period_duration,
         };
         e.storage().instance().set(&bond_key, &updated);
 
