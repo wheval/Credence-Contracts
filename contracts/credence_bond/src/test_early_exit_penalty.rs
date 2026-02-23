@@ -99,6 +99,7 @@ fn test_early_exit_fails_without_config() {
 #[should_panic(expected = "not admin")]
 fn test_set_early_exit_config_unauthorized() {
     let e = Env::default();
+    e.mock_all_auths();
     let contract_id = e.register_contract(None, CredenceBond);
     let client = CredenceBondClient::new(&e, &contract_id);
     let admin = Address::generate(&e);
@@ -112,6 +113,7 @@ fn test_set_early_exit_config_unauthorized() {
 #[should_panic(expected = "penalty_bps must be <= 10000")]
 fn test_set_early_exit_config_invalid_bps() {
     let e = Env::default();
+    e.mock_all_auths();
     let contract_id = e.register_contract(None, CredenceBond);
     let client = CredenceBondClient::new(&e, &contract_id);
     let admin = Address::generate(&e);

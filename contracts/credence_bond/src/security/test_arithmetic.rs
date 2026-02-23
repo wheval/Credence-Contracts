@@ -1,5 +1,5 @@
 //! Arithmetic Security Tests
-//! 
+//!
 //! This module contains comprehensive security tests for arithmetic operations
 //! to verify overflow and underflow protection in the Credence Bond contract.
 //!
@@ -67,7 +67,7 @@ fn test_i128_overflow_on_massive_slashing() {
 
     // Slash near-maximum amount first
     client.slash(&admin, &(i128::MAX / 2));
-    
+
     // Current slashed_amount is now i128::MAX / 2
     // Attempt to slash more than i128::MAX / 2, which will cause overflow in checked_add
     client.slash(&admin, &(i128::MAX / 2 + 2));
@@ -78,7 +78,7 @@ fn test_i128_large_bond_operations() {
     let e = Env::default();
     let (client, _admin, identity, ..) = test_helpers::setup_with_max_mint(&e);
     let large_amount = i128::MAX / 2;
-    
+
     // Create bond with large amount
     let bond = client.create_bond(&identity, &large_amount, &86400_u64, &false, &0_u64);
     assert_eq!(bond.bonded_amount, large_amount);
@@ -127,6 +127,7 @@ fn test_u64_overflow_on_duration_extension() {
 #[should_panic(expected = "bond end timestamp would overflow")]
 fn test_u64_overflow_on_end_timestamp() {
     let e = Env::default();
+    e.mock_all_auths();
     e.ledger().with_mut(|li| {
         // Set current timestamp to a very high value
         li.timestamp = u64::MAX - 1000;
@@ -143,7 +144,7 @@ fn test_u64_large_duration_extension() {
     let e = Env::default();
     let (client, _admin, identity, ..) = test_helpers::setup_with_token(&e);
     let duration = u64::MAX / 2;
-    
+
     // Create bond with large duration
     let bond = client.create_bond(&identity, &1000, &duration, &false, &0_u64);
     assert_eq!(bond.bond_duration, duration);
@@ -156,6 +157,7 @@ fn test_u64_large_duration_extension() {
 #[test]
 fn test_timestamp_boundary_conditions() {
     let e = Env::default();
+    e.mock_all_auths();
     // Set timestamp to near-max value
     e.ledger().with_mut(|li| {
         li.timestamp = u64::MAX - 10000;
@@ -164,7 +166,7 @@ fn test_timestamp_boundary_conditions() {
     let (client, _admin, identity, ..) = test_helpers::setup_with_token(&e);
     // Create bond with safe duration
     let bond = client.create_bond(&identity, &1000, &5000, &false, &0_u64);
-    
+
     assert_eq!(bond.bond_duration, 5000);
     assert!(bond.bond_start >= u64::MAX - 10000);
 }
