@@ -1,6 +1,8 @@
 #![no_std]
 
 mod early_exit_penalty;
+mod fees;
+mod governance_approval;
 mod nonce;
 mod rolling_bond;
 mod slashing;
@@ -9,7 +11,9 @@ mod weighted_attestation;
 
 pub mod types;
 
-use soroban_sdk::{contract, contractimpl, contracttype, Address, Env, String, Symbol, Vec};
+use soroban_sdk::{
+    contract, contractimpl, contracttype, Address, Env, IntoVal, String, Symbol, Val, Vec,
+};
 
 /// Identity tier based on bonded amount (Bronze < Silver < Gold < Platinum).
 #[contracttype]
@@ -55,6 +59,17 @@ pub enum DataKey {
     Nonce(Address),
     /// Attester stake used for weighted attestation (set by admin or from bond).
     AttesterStake(Address),
+    // Governance approval for slashing (#7)
+    GovernanceNextProposalId,
+    GovernanceProposal(u64),
+    GovernanceVote(u64, Address),
+    GovernanceDelegate(Address),
+    GovernanceGovernors,
+    GovernanceQuorumBps,
+    GovernanceMinGovernors,
+    // Bond creation fee (#15)
+    FeeTreasury,
+    FeeBps,
 }
 
 #[contract]
@@ -124,6 +139,7 @@ impl CredenceBond {
 
     /// Create or top-up a bond for an identity. In a full implementation this would
     /// transfer USDC from the caller and store the bond.
+    /// Bond creation fee (if configured) is deducted and recorded for treasury.
     pub fn create_bond(
         e: Env,
         identity: Address,
@@ -139,9 +155,17 @@ impl CredenceBond {
             .checked_add(duration)
             .expect("bond end timestamp would overflow");
 
+        let (fee, net_amount) = fees::calculate_fee(&e, amount);
+        if fee > 0 {
+            let (treasury_opt, _) = fees::get_config(&e);
+            if let Some(treasury) = treasury_opt {
+                fees::record_fee(&e, &identity, amount, fee, &treasury);
+            }
+        }
+
         let bond = IdentityBond {
             identity: identity.clone(),
-            bonded_amount: amount,
+            bonded_amount: net_amount,
             bond_start,
             bond_duration: duration,
             slashed_amount: 0,
@@ -152,7 +176,7 @@ impl CredenceBond {
         };
         let key = DataKey::Bond;
         e.storage().instance().set(&key, &bond);
-        let tier = tiered_bond::get_tier_for_amount(amount);
+        let tier = tiered_bond::get_tier_for_amount(net_amount);
         tiered_bond::emit_tier_change_if_needed(&e, &identity, BondTier::Bronze, tier);
         bond
     }
@@ -515,6 +539,119 @@ impl CredenceBond {
         slashing::slash_bond(&e, &admin, amount)
     }
 
+    /// Initialize governance for slash approval: set governors and quorum. Admin only.
+    pub fn initialize_governance(
+        e: Env,
+        admin: Address,
+        governors: Vec<Address>,
+        quorum_bps: u32,
+        min_governors: u32,
+    ) {
+        admin.require_auth();
+        let stored: Address = e
+            .storage()
+            .instance()
+            .get(&DataKey::Admin)
+            .unwrap_or_else(|| panic!("not initialized"));
+        if admin != stored {
+            panic!("not admin");
+        }
+        governance_approval::initialize_governance(&e, governors, quorum_bps, min_governors);
+    }
+
+    /// Propose a slash (admin or governor). Returns proposal id.
+    pub fn propose_slash(e: Env, proposer: Address, amount: i128) -> u64 {
+        proposer.require_auth();
+        let admin: Address = e
+            .storage()
+            .instance()
+            .get(&DataKey::Admin)
+            .unwrap_or_else(|| panic!("not initialized"));
+        let governors = governance_approval::get_governors(&e);
+        let is_governor = governors.iter().any(|g| g == proposer);
+        if proposer != admin && !is_governor {
+            panic!("not admin or governor");
+        }
+        governance_approval::propose_slash(&e, &proposer, amount)
+    }
+
+    /// Cast a governance vote (approve or reject). Governor or delegate only.
+    pub fn governance_vote(e: Env, voter: Address, proposal_id: u64, approve: bool) {
+        voter.require_auth();
+        governance_approval::vote(&e, &voter, proposal_id, approve);
+    }
+
+    /// Delegate voting power to another address. Governor only.
+    pub fn governance_delegate(e: Env, governor: Address, to: Address) {
+        governance_approval::delegate(&e, &governor, &to);
+    }
+
+    /// Execute an approved slash proposal. Only proposer may call; applies slash to bond.
+    pub fn execute_slash_with_governance(
+        e: Env,
+        proposer: Address,
+        proposal_id: u64,
+    ) -> IdentityBond {
+        proposer.require_auth();
+        let proposal = governance_approval::get_proposal(&e, proposal_id)
+            .unwrap_or_else(|| panic!("proposal not found"));
+        if proposal.proposed_by != proposer {
+            panic!("only proposer can execute");
+        }
+        let executed = governance_approval::execute_slash_if_approved(&e, proposal_id);
+        if !executed {
+            panic!("proposal not approved");
+        }
+        slashing::slash_bond(&e, &proposer, proposal.amount)
+    }
+
+    /// Set bond creation fee config (treasury and fee_bps). Admin only.
+    pub fn set_fee_config(e: Env, admin: Address, treasury: Address, fee_bps: u32) {
+        admin.require_auth();
+        let stored: Address = e
+            .storage()
+            .instance()
+            .get(&DataKey::Admin)
+            .unwrap_or_else(|| panic!("not initialized"));
+        if admin != stored {
+            panic!("not admin");
+        }
+        fees::set_config(&e, treasury, fee_bps);
+    }
+
+    /// Get fee config (treasury, fee_bps).
+    pub fn get_fee_config(e: Env) -> (Option<Address>, u32) {
+        fees::get_config(&e)
+    }
+
+    /// Get slash proposal by id.
+    pub fn get_slash_proposal(
+        e: Env,
+        proposal_id: u64,
+    ) -> Option<governance_approval::SlashProposal> {
+        governance_approval::get_proposal(&e, proposal_id)
+    }
+
+    /// Get governance vote for (proposal_id, voter).
+    pub fn get_governance_vote(e: Env, proposal_id: u64, voter: Address) -> Option<bool> {
+        governance_approval::get_vote(&e, proposal_id, &voter)
+    }
+
+    /// Get governors list.
+    pub fn get_governors(e: Env) -> Vec<Address> {
+        governance_approval::get_governors(&e)
+    }
+
+    /// Get delegate for a governor.
+    pub fn get_governance_delegate(e: Env, governor: Address) -> Option<Address> {
+        governance_approval::get_delegate(&e, &governor)
+    }
+
+    /// Get quorum config (quorum_bps, min_governors).
+    pub fn get_quorum_config(e: Env) -> (u32, u32) {
+        governance_approval::get_quorum_config(&e)
+    }
+
     /// Top up the bond with additional amount (checks for overflow)
     pub fn top_up(e: Env, amount: i128) -> IdentityBond {
         let key = DataKey::Bond;
@@ -597,13 +734,10 @@ impl CredenceBond {
             bond_start: bond.bond_start,
             bond_duration: bond.bond_duration,
             slashed_amount: bond.slashed_amount,
-            is_rolling: bond.is_rolling,
-            notice_period: bond.notice_period,
-            withdrawal_requested_at: bond.withdrawal_requested_at,
             active: false,
             is_rolling: bond.is_rolling,
             withdrawal_requested_at: bond.withdrawal_requested_at,
-            notice_period: bond.notice_period,
+            notice_period_duration: bond.notice_period_duration,
         };
         e.storage().instance().set(&bond_key, &updated);
 
@@ -661,13 +795,10 @@ impl CredenceBond {
             bond_start: bond.bond_start,
             bond_duration: bond.bond_duration,
             slashed_amount: new_slashed,
-            is_rolling: bond.is_rolling,
-            notice_period: bond.notice_period,
-            withdrawal_requested_at: bond.withdrawal_requested_at,
             active: bond.active,
             is_rolling: bond.is_rolling,
             withdrawal_requested_at: bond.withdrawal_requested_at,
-            notice_period: bond.notice_period,
+            notice_period_duration: bond.notice_period_duration,
         };
         e.storage().instance().set(&bond_key, &updated);
 
@@ -765,6 +896,15 @@ mod test_weighted_attestation;
 
 #[cfg(test)]
 mod test_replay_prevention;
+
+#[cfg(test)]
+mod test_governance_approval;
+
+#[cfg(test)]
+mod test_fees;
+
+#[cfg(test)]
+mod integration;
 
 #[cfg(test)]
 mod security;
