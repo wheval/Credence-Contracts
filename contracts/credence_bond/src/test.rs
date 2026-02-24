@@ -1,5 +1,3 @@
-#![cfg(test)]
-
 use super::*;
 use crate::test_helpers;
 use soroban_sdk::testutils::Address as _;

@@ -2,8 +2,6 @@
 //! Covers: penalty calculation from remaining lock time, configurable rates,
 //! penalty event emission, and security (zero/max penalty edge cases).
 
-#![cfg(test)]
-
 use crate::early_exit_penalty;
 use crate::test_helpers;
 use crate::{CredenceBond, CredenceBondClient};
@@ -124,7 +122,6 @@ fn test_set_early_exit_config_invalid_bps() {
 
 #[test]
 fn test_calculate_penalty_unit() {
-    let e = Env::default();
     // remaining = total -> full penalty rate applied
     let p = early_exit_penalty::calculate_penalty(1000, 100, 100, 500);
     assert_eq!(p, 50); // 5% of 1000
